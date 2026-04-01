@@ -1,76 +1,72 @@
-#!/bin/bash
-
-# 1. Set working environment to a clean, up-to-date 402
+# Ensure working environment is clean
 git fetch origin
 git checkout 402
 git reset --hard origin/402
 
-echo "================================================"
-echo "    402 Wasteland Reconstruction Toolkit"
-echo "================================================"
-echo "Paste the URLs of the PRs you want to restore (one per line)."
-echo "Press [ENTER] on a blank line when you are finished."
-echo ""
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host "    402 Wasteland Reconstruction Toolkit" -ForegroundColor Cyan
+Write-Host "================================================" -ForegroundColor Cyan
+Write-Host "Paste the URLs of the PRs you want to restore (one per line)."
+Write-Host "Press [ENTER] on a blank line when you are finished.`n"
 
-PR_URLS=()
-while true; do
-  read -p "> " URL
-  # Break the loop if the user just hits enter (blank line)
-  if [ -z "$URL" ]; then
-    break
-  fi
-  PR_URLS+=("$URL")
-done
+$prUrls = @()
+while ($true) {
+    $url = Read-Host ">"
+    # Break the loop if the user just hits enter
+    if ([string]::IsNullOrWhiteSpace($url)) {
+        break
+    }
+    $prUrls += $url
+}
 
-if [ ${#PR_URLS[@]} -eq 0 ]; then
-  echo "No PRs entered. Exiting."
-  exit 0
-fi
+if ($prUrls.Count -eq 0) {
+    Write-Host "No PRs entered. Exiting." -ForegroundColor Yellow
+    exit
+}
 
-echo ""
-echo "Starting Reconstruction..."
+Write-Host "`nStarting Reconstruction..." -ForegroundColor Green
 
-# Loop through the array of URLs
-for URL in "${PR_URLS[@]}"; do
-  
-  # Extract just the PR number from the end of the URL (e.g., /pull/123 -> 123)
-  PR_NUM="${URL##*/}"
-  
-  # Use gh CLI to grab the title so we can use it as the commit message
-  PR_TITLE=$(gh pr view "$PR_NUM" --json title -q .title)
-  
-  echo "------------------------------------------------"
-  echo "Restoring PR #$PR_NUM: $PR_TITLE"
-
-  # Fetch the underlying code exactly as it was in the PR, directly from GitHub
-  git fetch origin pull/"$PR_NUM"/head
-  
-  # Use native Git tree-merging to squash all changes into the working directory
-  if git merge --squash FETCH_HEAD; then
-    echo "✅ Merged cleanly using native Git logic."
+foreach ($url in $prUrls) {
+    # Extract PR number from the URL (gets the text after the final slash)
+    $prNum = ($url -split '/')[-1]
     
-    # Commit the squashed changes as one single commit
-    git commit -m "Restore PR #$PR_NUM: $PR_TITLE"
-  else
-    echo "❌ CONFLICT DETECTED!"
-    echo "Git's native conflict markers have been injected."
-    echo "1. Open your IDE and resolve the conflicts."
-    echo "2. Add the resolved files (git add .)"
-    echo "3. Commit using: git commit -m \"Restore PR #$PR_NUM: $PR_TITLE\""
-    echo "4. Come back here and press [ENTER] to continue."
+    # Grab the PR title using the GitHub CLI
+    $prTitle = gh pr view $prNum --json title -q .title
+    
+    Write-Host "------------------------------------------------"
+    Write-Host "Restoring PR #$prNum: $prTitle" -ForegroundColor Yellow
 
-    # Pause execution until the user manually resolves the conflict
-    read -p "Press [ENTER] when resolved and committed..."
+    # Fetch the hidden PR reference
+    git fetch origin pull/$prNum/head
+    
+    # Attempt native squash merge. 
+    # (2>&1 prevents PowerShell from panicking and stopping if Git outputs to stderr)
+    $mergeOutput = git merge --squash FETCH_HEAD 2>&1
+    
+    # $LASTEXITCODE checks if the previous Git command succeeded (0) or failed
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "✅ Merged cleanly using native Git logic." -ForegroundColor Green
+        git commit -m "Restore PR #$prNum: $prTitle"
+    } else {
+        Write-Host "❌ CONFLICT DETECTED!" -ForegroundColor Red
+        Write-Host "Git's native conflict markers have been injected."
+        Write-Host "1. Open your IDE and resolve the conflicts."
+        Write-Host "2. Add the resolved files (git add .)"
+        Write-Host "3. Commit using: git commit -m `"Restore PR #$prNum: $prTitle`""
+        Write-Host "4. Come back here and press [ENTER] to continue."
 
-    # Safety check: Ensure the user actually committed the changes before moving on
-    if ! git diff-index --quiet HEAD --; then
-         echo "⚠️ Uncommitted changes detected! Aborting script to prevent a cascade failure."
-         exit 1
-    fi
-    echo "✅ Conflict resolved. Moving to next PR..."
-  fi
-done
+        Read-Host "Press [ENTER] when resolved and committed..."
 
-echo "------------------------------------------------"
-echo "🎉 402 branch has been successfully reconstructed!"
-echo "Run 'git push origin 402' to deploy to the wasteland."
+        # Safety check: Ensure the user committed their fixes
+        git diff-index --quiet HEAD --
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "⚠️ Uncommitted changes detected! Aborting script to prevent a cascade failure." -ForegroundColor Red
+            exit
+        }
+        Write-Host "✅ Conflict resolved. Moving to next PR..." -ForegroundColor Green
+    }
+}
+
+Write-Host "------------------------------------------------"
+Write-Host "🎉 402 branch has been successfully reconstructed!" -ForegroundColor Cyan
+Write-Host "Run 'git push origin 402' to deploy to the wasteland."
