@@ -34,7 +34,8 @@ foreach ($url in $prUrls) {
     $prTitle = gh pr view $prNum --json title -q .title
     
     Write-Host "------------------------------------------------"
-    Write-Host "Restoring PR #$prNum: $prTitle" -ForegroundColor Yellow
+    # FIXED: Wrapped prNum in curly braces to protect it from the colon
+    Write-Host "Restoring PR #${prNum}: $prTitle" -ForegroundColor Yellow
 
     # Fetch the hidden PR reference
     git fetch origin pull/$prNum/head
@@ -46,13 +47,15 @@ foreach ($url in $prUrls) {
     # $LASTEXITCODE checks if the previous Git command succeeded (0) or failed
     if ($LASTEXITCODE -eq 0) {
         Write-Host "✅ Merged cleanly using native Git logic." -ForegroundColor Green
-        git commit -m "Restore PR #$prNum: $prTitle"
+        # FIXED: Wrapped prNum in curly braces
+        git commit -m "Restore PR #${prNum}: $prTitle"
     } else {
         Write-Host "❌ CONFLICT DETECTED!" -ForegroundColor Red
         Write-Host "Git's native conflict markers have been injected."
         Write-Host "1. Open your IDE and resolve the conflicts."
         Write-Host "2. Add the resolved files (git add .)"
-        Write-Host "3. Commit using: git commit -m `"Restore PR #$prNum: $prTitle`""
+        # FIXED: Wrapped prNum in curly braces
+        Write-Host "3. Commit using: git commit -m `"Restore PR #${prNum}: $prTitle`""
         Write-Host "4. Come back here and press [ENTER] to continue."
 
         Read-Host "Press [ENTER] when resolved and committed..."
