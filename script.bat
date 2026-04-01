@@ -1,5 +1,5 @@
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "    402 Single PR Restorer" -ForegroundColor Cyan
+Write-Host "    402 Single PR Restorer (Diff Mode)" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 
 # 1. Prompt for the repository location and actively strip any accidental quotes
@@ -38,11 +38,10 @@ if ([string]::IsNullOrWhiteSpace($url)) {
 # Extract PR number from the URL
 $prNum = ($url -split '/')[-1]
 
-Write-Host "Fetching PR details from GitHub..." -ForegroundColor DarkGray
+Write-Host "Fetching PR details and isolated diff from GitHub..." -ForegroundColor DarkGray
 
-# Grab both the PR Title and the Source Branch Name in one call using the GH CLI
-# We use 2>&1 to capture any error messages (like the auth warning)
-$ghOutput = gh pr view $prNum --json title,headRefName 2>&1
+# Grab the PR Title
+$ghOutput = gh pr view $prNum --json title 2>&1
 
 # Check if the GitHub CLI command actually succeeded
 if ($LASTEXITCODE -ne 0) {
@@ -52,34 +51,34 @@ if ($LASTEXITCODE -ne 0) {
     exit
 }
 
-# If successful, parse the JSON
+# Parse the JSON for the title
 $prData = $ghOutput | ConvertFrom-Json
 $prTitle = $prData.title
-$branchName = $prData.headRefName
-
-# Double-check that we actually got a branch name back
-if ([string]::IsNullOrWhiteSpace($branchName)) {
-    Write-Host "❌ Error: Could not determine the source branch name for PR #${prNum}." -ForegroundColor Red
-    exit
-}
 
 Write-Host "------------------------------------------------"
 Write-Host "Restoring PR #${prNum}: $prTitle" -ForegroundColor Yellow
-Write-Host "Targeting branch: origin/$branchName" -ForegroundColor DarkGray
 
-# Attempt native squash merge using your local, already-updated remote tracking branch
-$mergeOutput = git merge --squash "origin/$branchName" 2>&1
+# Fetch the PR head silently. We don't merge this, but git apply --3way 
+# needs the file blobs downloaded locally to calculate the conflict markers.
+git fetch origin pull/$prNum/head --quiet
+
+# Download the exact, isolated diff of the PR
+gh pr diff $prNum > pr_diff.patch
+
+# Apply the diff directly over the current code
+$applyOutput = git apply --3way pr_diff.patch 2>&1
 
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "✅ Merged cleanly using native Git logic." -ForegroundColor Green
+    Write-Host "✅ Diff applied cleanly." -ForegroundColor Green
     
-    # Commit immediately
+    # Stage the applied files and commit
+    git add .
     git commit -m "Restore PR #${prNum}: $prTitle"
     
     Write-Host "🎉 PR #${prNum} successfully committed to your local 402 branch!" -ForegroundColor Cyan
 } else {
     Write-Host "❌ CONFLICT DETECTED!" -ForegroundColor Red
-    Write-Host "Git's native conflict markers have been injected."
+    Write-Host "Git's 3-way merge has injected conflict markers into the files."
     Write-Host "1. Open your IDE and resolve the conflicts."
     Write-Host "2. Add the resolved files (git add .)"
     Write-Host "3. Commit using: git commit -m `"Restore PR #${prNum}: $prTitle`""
@@ -87,11 +86,16 @@ if ($LASTEXITCODE -eq 0) {
 
     Read-Host "`nPress [ENTER] when resolved and committed..."
 
-    # Safety check: Ensure the user committed their fixes
+    # Safety check: Ensure the user actually committed their fixes
     git diff-index --quiet HEAD --
     if ($LASTEXITCODE -ne 0) {
         Write-Host "⚠️ Uncommitted changes detected! You'll need to commit them manually." -ForegroundColor Red
-        exit
+    } else {
+        Write-Host "✅ Conflict resolved. PR #${prNum} restored!" -ForegroundColor Green
     }
-    Write-Host "✅ Conflict resolved. PR #${prNum} restored!" -ForegroundColor Green
+}
+
+# Clean up the temporary patch file
+if (Test-Path pr_diff.patch) {
+    Remove-Item pr_diff.patch
 }
