@@ -62,8 +62,10 @@ Write-Host "Restoring PR #${prNum}: $prTitle" -ForegroundColor Yellow
 # needs the file blobs downloaded locally to calculate the conflict markers.
 git fetch origin pull/$prNum/head --quiet
 
-# Download the exact, isolated diff of the PR
-gh pr diff $prNum > pr_diff.patch
+# Download the exact, isolated diff of the PR.
+# We use cmd.exe to bypass PowerShell's default UTF-16 encoding, 
+# which injects NULL bytes and completely breaks 'git apply'.
+cmd.exe /c "gh pr diff $prNum > pr_diff.patch"
 
 # Apply the diff directly over the current code
 $applyOutput = git apply --3way pr_diff.patch 2>&1
@@ -77,9 +79,11 @@ if ($LASTEXITCODE -eq 0) {
     
     Write-Host "🎉 PR #${prNum} successfully committed to your local 402 branch!" -ForegroundColor Cyan
 } else {
-    Write-Host "❌ CONFLICT DETECTED!" -ForegroundColor Red
-    Write-Host "Git's 3-way merge has injected conflict markers into the files."
-    Write-Host "1. Open your IDE and resolve the conflicts."
+    Write-Host "❌ CONFLICT OR ERROR DETECTED!" -ForegroundColor Red
+    Write-Host "Git reported the following:" -ForegroundColor Yellow
+    Write-Host $applyOutput -ForegroundColor DarkGray
+    Write-Host "`nGit's 3-way merge may have injected conflict markers into the files."
+    Write-Host "1. Open your IDE and resolve any conflicts."
     Write-Host "2. Add the resolved files (git add .)"
     Write-Host "3. Commit using: git commit -m `"Restore PR #${prNum}: $prTitle`""
     Write-Host "4. Come back here and press [ENTER] to finish."
