@@ -1,44 +1,13 @@
 Write-Host "================================================" -ForegroundColor Cyan
 Write-Host "    402 Wasteland Reconstruction Toolkit" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
-
-# 1. Prompt for the repository location and actively strip any accidental quotes
-$rawInput = Read-Host "Enter the full path to your local git repository (e.g., C:\dev\monolith)"
-$repoPath = $rawInput.Trim('"').Trim("'")
-
-# 2. Validate the directory exists
-if (-Not (Test-Path -Path $repoPath)) {
-    Write-Host "❌ Error: The directory '$repoPath' does not exist." -ForegroundColor Red
-    exit
-}
-
-# 3. Validate it is actually a Git repository
-$gitPath = Join-Path -Path $repoPath -ChildPath ".git"
-if (-Not (Test-Path -Path $gitPath)) {
-    Write-Host "❌ Error: '$repoPath' is not a valid Git repository (no .git folder found)." -ForegroundColor Red
-    exit
-}
-
-# 4. Change PowerShell's directory AND explicitly force the underlying Windows process directory to match
-Set-Location -Path $repoPath
-[Environment]::CurrentDirectory = $PWD.Path
-Write-Host "✅ Set working directory to: $repoPath`n" -ForegroundColor Green
-
-# ---------------------------------------------------------
-# Git Commands safely execute down here!
-# ---------------------------------------------------------
-
-# Ensure working environment is clean
-git fetch origin
-git checkout 402
-git reset --hard origin/402
-
 Write-Host "`nPaste the URLs of the PRs you want to restore (one per line)."
 Write-Host "Press [ENTER] on a blank line when you are finished.`n"
 
 $prUrls = @()
 while ($true) {
     $url = Read-Host ">"
+    # Break the loop if the user just hits enter
     if ([string]::IsNullOrWhiteSpace($url)) {
         break
     }
