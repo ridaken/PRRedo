@@ -6,7 +6,7 @@
 #    .\restore_402.ps1 -DryRun      Preview only - no files are modified
 #
 #  REQUIREMENTS:
-#    - Run AFTER you have already done: git fetch && git checkout 402
+#    - Run AFTER you have already done: git fetch && git checkout environment/402
 #    - A portable gh.exe must be on your PATH (or next to this script)
 # =============================================================================
 param(
@@ -16,12 +16,6 @@ param(
 $ErrorActionPreference = "Stop"
 $startTime = Get-Date
 
-# Conflict marker strings stored in variables to avoid PowerShell parser issues
-$markerConflict = "CONFLICT MARKERS"
-$markerOpen     = "<<< CONFLICT"
-$markerSep      = "=== SEPARATOR"
-$markerClose    = ">>> END"
-
 # ── Colour helpers ────────────────────────────────────────────────────────────
 function Write-Ok   { param($t) Write-Host "  [OK]  $t" -ForegroundColor Green }
 function Write-Warn { param($t) Write-Host "  [!!]  $t" -ForegroundColor Yellow }
@@ -29,11 +23,23 @@ function Write-Err  { param($t) Write-Host "  [XX]  $t" -ForegroundColor Red }
 function Write-Info { param($t) Write-Host "  [ ]   $t" -ForegroundColor DarkGray }
 function Write-Step { param($t) Write-Host "`n[ $t ]" -ForegroundColor Magenta }
 
+# ── Helper: write a git object to a file safely via cmd.exe ──────────────────
+# Using PowerShell's pipeline to write binary/text from git show corrupts line
+# endings and collapses files to a single line. cmd.exe redirection is reliable.
+function Write-GitObjectToFile {
+    param(
+        [string]$GitRef,   # e.g. "FETCH_HEAD:src/Foo.java"
+        [string]$OutPath   # absolute path to write to
+    )
+    cmd.exe /c "git show `"$GitRef`" > `"$OutPath`""
+    return $LASTEXITCODE
+}
+
 # ── Banner ────────────────────────────────────────────────────────────────────
 Clear-Host
 Write-Host ""
 Write-Host "  +----------------------------------------------+" -ForegroundColor Cyan
-Write-Host "  |      402 Wasteland  -  PR Restorer  v3       |" -ForegroundColor Cyan
+Write-Host "  |      402 Wasteland  -  PR Restorer  v4       |" -ForegroundColor Cyan
 if ($DryRun) {
     Write-Host "  |           *** DRY RUN MODE ***               |" -ForegroundColor Yellow
 }
@@ -78,19 +84,7 @@ Set-Location -Path $repoPath
 [Environment]::CurrentDirectory = $PWD.Path
 Write-Ok "Repository: $repoPath"
 
-# ── 1c. Must be on 402 ────────────────────────────────────────────────────────
-$currentBranch = git branch --show-current 2>&1
-if ($currentBranch -ne "402") {
-    Write-Err "You are on branch '$currentBranch', not '402'."
-    Write-Host "     Run: git checkout 402" -ForegroundColor Yellow
-    $confirm = Read-Host "`n  Type YES to continue anyway (not recommended)"
-    if ($confirm -ne "YES") { exit 1 }
-    Write-Warn "Continuing on '$currentBranch' at user request."
-} else {
-    Write-Ok "Branch: 402  (confirmed)"
-}
-
-# ── 1d. Clean working tree ────────────────────────────────────────────────────
+# ── 1c. Clean working tree ────────────────────────────────────────────────────
 $dirty = git status --porcelain 2>&1
 if ($dirty) {
     Write-Err "Working tree has uncommitted changes:"
@@ -112,7 +106,6 @@ if ([string]::IsNullOrWhiteSpace($url)) {
     exit 1
 }
 
-# Accept both a full URL and a bare number
 if ($url -match '^\d+$') {
     $prNum = $url
 } else {
@@ -145,7 +138,7 @@ Write-Host "  Title  : $prTitle" -ForegroundColor White
 Write-Host "  Author : $prAuthor   Branch: $prBranch   State: $prState" -ForegroundColor DarkGray
 
 if ($prState -eq "MERGED") {
-    Write-Warn "This PR is already MERGED - its changes may already be in 402."
+    Write-Warn "This PR is already MERGED - its changes may already be in the branch."
     $confirm = Read-Host "  Type YES to restore it anyway"
     if ($confirm -ne "YES") { exit 0 }
 }
@@ -178,7 +171,6 @@ if (-not (Test-Path $patchFile) -or (Get-Item $patchFile).Length -eq 0) {
     exit 1
 }
 
-# Confirm it is a real diff and not a gh error message written to stdout
 $firstLine = Get-Content $patchFile -TotalCount 1
 if ($firstLine -notlike "diff --git*") {
     Write-Err "Downloaded file does not look like a valid patch."
@@ -215,7 +207,6 @@ Write-Host ""
 Write-Host "  This patch touches $($affectedFiles.Count) file(s):" -ForegroundColor White
 $affectedFiles | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkYellow }
 
-# ── Dry-run exits here ────────────────────────────────────────────────────────
 if ($DryRun) {
     Write-Host ""
     Write-Warn "DRY RUN - no files were modified."
@@ -236,16 +227,19 @@ if ($proceed -eq 'n' -or $proceed -eq 'N') {
 #  SECTION 5 - APPLY VIA git merge-file
 #
 #  For each file in the patch we perform a genuine 3-way text merge.
-#  This bypasses git apply entirely and guarantees that conflicts produce
-#  inline markers in the file rather than .rej sidecar files.
+#  All temp files are written via cmd.exe redirection to guarantee correct
+#  line endings - PowerShell pipeline encoding corrupts git show output
+#  and causes git merge-file to see the entire file as one line, which
+#  produces a single giant conflict block instead of surgical markers.
 #
 #  Three inputs to git merge-file:
-#    OURS   = current file on disk in 402 (the freshly reset branch)
-#    BASE   = file at FETCH_HEAD~1 (approximates where the PR author branched)
+#    OURS   = current file on disk (the reset branch)
+#    BASE   = file at FETCH_HEAD~1 (where the PR author branched from)
 #             Falls back to OURS if unavailable.
 #    THEIRS = file at FETCH_HEAD (tip of the PR branch)
 #
-#  git merge-file modifies the OURS file in place.
+#  git merge-file modifies the OURS temp file in place, then we copy it
+#  back over the working copy. No commits are made.
 #    Exit  0  = clean merge
 #    Exit >0  = N conflict blocks written as inline markers
 #    Exit <0  = error (e.g. binary file)
@@ -262,12 +256,14 @@ New-Item -ItemType Directory -Path $tempDir -Force | Out-Null
 
 foreach ($relPath in $affectedFiles) {
 
-    $absPath = Join-Path $repoPath ($relPath -replace '/', '\')
+    $absPath  = Join-Path $repoPath ($relPath -replace '/', '\')
+    $safeName = $relPath -replace '[/\\:.]', '_'
 
     Write-Host ""
     Write-Host "  -- $relPath" -ForegroundColor White
 
-    $theirsRaw    = git show "FETCH_HEAD:$relPath" 2>&1
+    # Check existence on each side using git cat-file to avoid pipeline issues
+    git cat-file -e "FETCH_HEAD:$relPath" 2>&1 | Out-Null
     $theirsExists = ($LASTEXITCODE -eq 0)
     $oursExists   = (Test-Path $absPath)
 
@@ -278,12 +274,13 @@ foreach ($relPath in $affectedFiles) {
         if (-not (Test-Path $dir)) {
             New-Item -ItemType Directory -Path $dir -Force | Out-Null
         }
-        $safeName   = $relPath -replace '[/\\:]', '_'
-        $newFileTmp = Join-Path $tempDir "new_$safeName"
-        $theirsRaw | Set-Content -Path $newFileTmp -Encoding UTF8 -NoNewline
-        Copy-Item $newFileTmp $absPath -Force
-        $newFiles += $relPath
-        Write-Ok "Created: $relPath"
+        $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $absPath
+        if ($exitCode -eq 0) {
+            $newFiles += $relPath
+            Write-Ok "Created: $relPath"
+        } else {
+            Write-Err "Failed to write new file: $relPath"
+        }
         continue
     }
 
@@ -298,33 +295,46 @@ foreach ($relPath in $affectedFiles) {
 
     # ── Guard: missing from both sides ───────────────────────────────────────
     if ((-not $oursExists) -and (-not $theirsExists)) {
-        Write-Warn "Cannot find '$relPath' in OURS or THEIRS - skipping."
+        Write-Warn "Cannot find '$relPath' in working tree or PR head - skipping."
         continue
     }
 
     # ── Modified file - 3-way merge ───────────────────────────────────────────
-    $safeName   = $relPath -replace '[/\\:]', '_'
     $oursFile   = Join-Path $tempDir "ours_$safeName"
     $baseFile   = Join-Path $tempDir "base_$safeName"
     $theirsFile = Join-Path $tempDir "theirs_$safeName"
 
+    # OURS: copy the live working file (already correct encoding on disk)
     Copy-Item $absPath $oursFile
 
-    $theirsRaw | Set-Content -Path $theirsFile -Encoding UTF8 -NoNewline
-
-    $baseRaw = git show "FETCH_HEAD~1:$relPath" 2>&1
-    if ($LASTEXITCODE -eq 0) {
-        $baseRaw | Set-Content -Path $baseFile -Encoding UTF8 -NoNewline
-        Write-Info "Base: FETCH_HEAD~1"
-    } else {
-        Copy-Item $absPath $baseFile
-        Write-Warn "FETCH_HEAD~1 has no copy of this file - using OURS as base (merge may be noisier)."
+    # THEIRS: write via cmd.exe to preserve line endings from git
+    $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $theirsFile
+    if ($exitCode -ne 0) {
+        Write-Err "Could not retrieve THEIRS for '$relPath' - skipping."
+        continue
     }
 
-    # Build args array to avoid backtick line continuation bugs in PowerShell
+    # BASE: try the parent commit of the PR tip (where the author branched from)
+    git cat-file -e "FETCH_HEAD~1:$relPath" 2>&1 | Out-Null
+    if ($LASTEXITCODE -eq 0) {
+        $exitCode = Write-GitObjectToFile "FETCH_HEAD~1:$relPath" $baseFile
+        if ($exitCode -ne 0) {
+            # Write failed despite object existing - fall back to OURS
+            Copy-Item $absPath $baseFile
+            Write-Warn "Could not write BASE from FETCH_HEAD~1 - using OURS as base."
+        } else {
+            Write-Info "Base: FETCH_HEAD~1"
+        }
+    } else {
+        # File didn't exist in the parent commit - use OURS as base
+        Copy-Item $absPath $baseFile
+        Write-Warn "File not present at FETCH_HEAD~1 - using OURS as base (merge may be noisier)."
+    }
+
+    # Run the 3-way merge. git merge-file modifies $oursFile in place.
     $mergeArgs = @(
-        "-L", "402 (current)",
-        "-L", "base",
+        "-L", "Current branch",
+        "-L", "Base",
         "-L", "PR #${prNum}: $prTitle",
         $oursFile,
         $baseFile,
@@ -334,6 +344,7 @@ foreach ($relPath in $affectedFiles) {
     git merge-file @mergeArgs 2>&1 | Out-Null
     $mergeExit = $LASTEXITCODE
 
+    # Copy the merged result back over the working copy file
     Copy-Item $oursFile $absPath -Force
 
     if ($mergeExit -eq 0) {
@@ -343,8 +354,8 @@ foreach ($relPath in $affectedFiles) {
         $conflictFiles += $relPath
         Write-Warn "$mergeExit conflict block(s) - markers written into file."
     } else {
-        Write-Err "git merge-file error on '$relPath' (exit $mergeExit) - may be binary."
-        Write-Host "     You will need to restore this file manually." -ForegroundColor Yellow
+        Write-Err "git merge-file error (exit $mergeExit) - file may be binary."
+        Write-Host "     Restore this file manually from the PR." -ForegroundColor Yellow
         $conflictFiles += $relPath
     }
 }
@@ -352,68 +363,36 @@ foreach ($relPath in $affectedFiles) {
 Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
 
 # =============================================================================
-#  SECTION 6 - COMMIT OR HAND OFF
+#  SECTION 6 - FINAL SUMMARY
 # =============================================================================
-$elapsed   = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 1)
-$commitMsg = "Restore PR #${prNum}: $prTitle`n`nSource: $url"
+$elapsed = [math]::Round(((Get-Date) - $startTime).TotalSeconds, 1)
 
 Write-Step "Summary"
 Write-Host ""
 Write-Host "  Files processed  : $($affectedFiles.Count)" -ForegroundColor White
 
-if ($cleanFiles.Count   -gt 0) { Write-Ok   "Clean merges  : $($cleanFiles.Count)  ($($cleanFiles -join ', '))" }
-if ($newFiles.Count     -gt 0) { Write-Ok   "New files     : $($newFiles.Count)  ($($newFiles -join ', '))" }
-if ($deletedFiles.Count -gt 0) { Write-Ok   "Deleted files : $($deletedFiles.Count)  ($($deletedFiles -join ', '))" }
-if ($conflictFiles.Count -gt 0){ Write-Warn "Conflicts     : $($conflictFiles.Count)  ($($conflictFiles -join ', '))" }
+if ($cleanFiles.Count    -gt 0) { Write-Ok   "Clean merges  : $($cleanFiles.Count)  ($($cleanFiles -join ', '))" }
+if ($newFiles.Count      -gt 0) { Write-Ok   "New files     : $($newFiles.Count)  ($($newFiles -join ', '))" }
+if ($deletedFiles.Count  -gt 0) { Write-Ok   "Deleted files : $($deletedFiles.Count)  ($($deletedFiles -join ', '))" }
+if ($conflictFiles.Count -gt 0) { Write-Warn "Conflicts     : $($conflictFiles.Count)  ($($conflictFiles -join ', '))" }
 
 Write-Host "  Elapsed          : ${elapsed}s" -ForegroundColor DarkGray
 Write-Host ""
 
-# ── All clean - auto commit ───────────────────────────────────────────────────
 if ($conflictFiles.Count -eq 0) {
-    git add .
-    git commit -m $commitMsg
-
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
-    Write-Host "  |   PR #$prNum restored and committed!           |" -ForegroundColor Green
+    Write-Host "  |   All changes applied cleanly.               |" -ForegroundColor Green
+    Write-Host "  |   Review in your IDE, then commit and push.  |" -ForegroundColor Green
     Write-Host "  +----------------------------------------------+" -ForegroundColor Green
-    Write-Host ""
-    Write-Host "  When ready to push:" -ForegroundColor Cyan
-    Write-Host "    git push origin 402" -ForegroundColor White
-    Write-Host ""
-
-# ── Conflicts need manual resolution ─────────────────────────────────────────
 } else {
-    Write-Host "  These files contain conflict markers that need manual resolution:" -ForegroundColor Yellow
+    Write-Host "  These files contain conflict markers to resolve:" -ForegroundColor Yellow
     $conflictFiles | ForEach-Object { Write-Host "     -> $_" -ForegroundColor DarkYellow }
     Write-Host ""
-    Write-Host "  Steps to resolve:" -ForegroundColor Cyan
-    Write-Host "    1. Open each file above in your IDE"
-    Write-Host "    2. Search for and resolve all conflict marker blocks"
-    Write-Host "    3. git add ."
-    Write-Host "    4. git commit -m `"Restore PR #${prNum}: $prTitle`""
-    Write-Host "    5. git push origin 402"
-    Write-Host ""
-
-    Read-Host "  Press ENTER once you have committed all resolved conflicts..."
-
-    git diff-index --quiet HEAD -- 2>&1 | Out-Null
-    if ($LASTEXITCODE -ne 0) {
-        Write-Warn "Uncommitted changes still detected - please commit before continuing."
-    } else {
-        $markerCheck = git diff --check 2>&1
-        if ($markerCheck) {
-            Write-Warn "Possible leftover conflict markers detected:"
-            $markerCheck | ForEach-Object { Write-Host "     $_" -ForegroundColor DarkGray }
-        } else {
-            Write-Ok "All conflicts resolved. PR #$prNum restored successfully!"
-            Write-Host ""
-            Write-Host "  When ready to push:" -ForegroundColor Cyan
-            Write-Host "    git push origin 402" -ForegroundColor White
-            Write-Host ""
-        }
-    }
+    Write-Host "  Open each file in your IDE and search for conflict marker blocks." -ForegroundColor Cyan
+    Write-Host "  Once resolved, review all changes, then commit and push." -ForegroundColor Cyan
 }
+
+Write-Host ""
 
 # ── Cleanup ───────────────────────────────────────────────────────────────────
 if (Test-Path $patchFile) { Remove-Item $patchFile -ErrorAction SilentlyContinue }
