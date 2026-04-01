@@ -41,9 +41,27 @@ $prNum = ($url -split '/')[-1]
 Write-Host "Fetching PR details from GitHub..." -ForegroundColor DarkGray
 
 # Grab both the PR Title and the Source Branch Name in one call using the GH CLI
-$prData = gh pr view $prNum --json title,headRefName | ConvertFrom-Json
+# We use 2>&1 to capture any error messages (like the auth warning)
+$ghOutput = gh pr view $prNum --json title,headRefName 2>&1
+
+# Check if the GitHub CLI command actually succeeded
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "❌ Failed to fetch PR details. The GitHub CLI reported the following error:" -ForegroundColor Red
+    Write-Host "$ghOutput" -ForegroundColor Yellow
+    Write-Host "`nPlease ensure you are authenticated by running 'gh auth login' in your terminal." -ForegroundColor Cyan
+    exit
+}
+
+# If successful, parse the JSON
+$prData = $ghOutput | ConvertFrom-Json
 $prTitle = $prData.title
 $branchName = $prData.headRefName
+
+# Double-check that we actually got a branch name back
+if ([string]::IsNullOrWhiteSpace($branchName)) {
+    Write-Host "❌ Error: Could not determine the source branch name for PR #${prNum}." -ForegroundColor Red
+    exit
+}
 
 Write-Host "------------------------------------------------"
 Write-Host "Restoring PR #${prNum}: $prTitle" -ForegroundColor Yellow
