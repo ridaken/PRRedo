@@ -1,8 +1,8 @@
 Write-Host "================================================" -ForegroundColor Cyan
-Write-Host "    402 Single PR Restorer (Diff Mode)" -ForegroundColor Cyan
+Write-Host "    402 Single PR Restorer (Diff Mode) v2" -ForegroundColor Cyan
 Write-Host "================================================" -ForegroundColor Cyan
 
-# 1. Prompt for the repository location and actively strip any accidental quotes
+# 1. Prompt for the repository location and strip accidental quotes
 $rawInput = Read-Host "Enter the full path to your local git repository (e.g., C:\dev\monolith)"
 $repoPath = $rawInput.Trim('"').Trim("'")
 
@@ -15,91 +15,115 @@ if (-Not (Test-Path -Path $repoPath)) {
 # 3. Validate it is actually a Git repository
 $gitPath = Join-Path -Path $repoPath -ChildPath ".git"
 if (-Not (Test-Path -Path $gitPath)) {
-    Write-Host "❌ Error: '$repoPath' is not a valid Git repository (no .git folder found)." -ForegroundColor Red
+    Write-Host "❌ Error: '$repoPath' is not a valid Git repository." -ForegroundColor Red
     exit
 }
 
-# 4. Change PowerShell's directory AND explicitly force the underlying Windows process directory to match
+# 4. Set working directory (PowerShell + underlying process)
 Set-Location -Path $repoPath
 [Environment]::CurrentDirectory = $PWD.Path
-Write-Host "✅ Set working directory to: $repoPath" -ForegroundColor Green
+Write-Host "✅ Working directory: $repoPath" -ForegroundColor Green
 
 # ---------------------------------------------------------
 # Repository set. Begin PR Restoration.
 # ---------------------------------------------------------
 
 $url = Read-Host "`nPaste the URL of the PR you want to restore"
-
 if ([string]::IsNullOrWhiteSpace($url)) {
     Write-Host "No URL provided. Exiting." -ForegroundColor Yellow
     exit
 }
 
-# Extract PR number from the URL
 $prNum = ($url -split '/')[-1]
+Write-Host "Fetching PR details from GitHub..." -ForegroundColor DarkGray
 
-Write-Host "Fetching PR details and isolated diff from GitHub..." -ForegroundColor DarkGray
-
-# Grab the PR Title
 $ghOutput = gh pr view $prNum --json title 2>&1
-
-# Check if the GitHub CLI command actually succeeded
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "❌ Failed to fetch PR details. The GitHub CLI reported the following error:" -ForegroundColor Red
+    Write-Host "❌ Failed to fetch PR details:" -ForegroundColor Red
     Write-Host "$ghOutput" -ForegroundColor Yellow
-    Write-Host "`nPlease ensure you are authenticated by running 'gh auth login' in your terminal." -ForegroundColor Cyan
+    Write-Host "Run 'gh auth login' if not authenticated." -ForegroundColor Cyan
     exit
 }
 
-# Parse the JSON for the title
-$prData = $ghOutput | ConvertFrom-Json
-$prTitle = $prData.title
+$prData    = $ghOutput | ConvertFrom-Json
+$prTitle   = $prData.title
+$patchFile = "pr_$prNum.patch"
 
 Write-Host "------------------------------------------------"
 Write-Host "Restoring PR #${prNum}: $prTitle" -ForegroundColor Yellow
 
-# Fetch the PR head silently. We don't merge this, but git apply --3way 
-# needs the file blobs downloaded locally to calculate the conflict markers.
-git fetch origin pull/$prNum/head --quiet
+# Fetch the PR head blobs so --3way has what it needs for object lookup
+Write-Host "Fetching PR head ref..." -ForegroundColor DarkGray
+git fetch origin "pull/$prNum/head" --quiet
 
-# Download the exact, isolated diff of the PR.
-# We use cmd.exe to bypass PowerShell's default UTF-16 encoding, 
-# which injects NULL bytes and completely breaks 'git apply'.
-cmd.exe /c "gh pr diff $prNum > pr_diff.patch"
+# Download the isolated diff via cmd.exe to guarantee UTF-8 (not PowerShell's UTF-16)
+Write-Host "Downloading patch..." -ForegroundColor DarkGray
+cmd.exe /c "gh pr diff $prNum > $patchFile"
 
-# Apply the diff directly over the current code
-$applyOutput = git apply --3way pr_diff.patch 2>&1
+if (-Not (Test-Path $patchFile) -or (Get-Item $patchFile).Length -eq 0) {
+    Write-Host "❌ Patch file is empty or missing. The PR may have no diff or gh failed." -ForegroundColor Red
+    exit
+}
+
+# ---------------------------------------------------------
+# ATTEMPT 1: Clean apply with context tolerance
+#   --3way          : fall back to 3-way merge on context mismatch
+#   --recount       : recount hunk lengths in case line counts drifted
+#   --whitespace=fix: silently fix whitespace issues instead of erroring
+# ---------------------------------------------------------
+Write-Host "`nAttempting clean apply (with context tolerance)..." -ForegroundColor DarkGray
+$applyOutput = git apply --3way --recount --whitespace=fix $patchFile 2>&1
 
 if ($LASTEXITCODE -eq 0) {
-    Write-Host "✅ Diff applied cleanly." -ForegroundColor Green
-    
-    # Stage the applied files and commit
+    Write-Host "✅ Diff applied cleanly!" -ForegroundColor Green
     git add .
     git commit -m "Restore PR #${prNum}: $prTitle"
-    
-    Write-Host "🎉 PR #${prNum} successfully committed to your local 402 branch!" -ForegroundColor Cyan
+    Write-Host "🎉 PR #${prNum} successfully committed to local 402!" -ForegroundColor Cyan
+    if (Test-Path $patchFile) { Remove-Item $patchFile }
+    exit
+}
+
+Write-Host "⚠️  Clean apply failed. Conflict details:" -ForegroundColor Yellow
+Write-Host $applyOutput -ForegroundColor DarkGray
+
+# ---------------------------------------------------------
+# ATTEMPT 2: --reject mode
+#   Instead of aborting entirely, git writes .rej files for hunks
+#   that can't apply, and DOES apply everything else cleanly.
+#   This gives the developer a surgical list of what needs manual work.
+# ---------------------------------------------------------
+Write-Host "`nFalling back to --reject mode (applies what it can, writes .rej for the rest)..." -ForegroundColor Yellow
+git apply --reject --recount --whitespace=fix $patchFile 2>&1 | Out-Null
+
+# Find all .rej files so we can tell the developer exactly what needs attention
+$rejFiles = Get-ChildItem -Path $repoPath -Filter "*.rej" -Recurse | Select-Object -ExpandProperty FullName
+
+Write-Host "`n❌ Some hunks could not be applied automatically." -ForegroundColor Red
+
+if ($rejFiles.Count -gt 0) {
+    Write-Host "`nThe following .rej files show the exact lines that need manual merging:" -ForegroundColor Yellow
+    $rejFiles | ForEach-Object { Write-Host "  → $_" -ForegroundColor DarkYellow }
+    Write-Host "`nFor each .rej file:" -ForegroundColor Cyan
+    Write-Host "  1. Open the corresponding source file in your IDE"
+    Write-Host "  2. The .rej file shows the hunk Git couldn't place — find where it belongs and apply it manually"
+    Write-Host "  3. Delete the .rej file when done"
 } else {
-    Write-Host "❌ CONFLICT OR ERROR DETECTED!" -ForegroundColor Red
-    Write-Host "Git reported the following:" -ForegroundColor Yellow
-    Write-Host $applyOutput -ForegroundColor DarkGray
-    Write-Host "`nGit's 3-way merge may have injected conflict markers into the files."
-    Write-Host "1. Open your IDE and resolve any conflicts."
-    Write-Host "2. Add the resolved files (git add .)"
-    Write-Host "3. Commit using: git commit -m `"Restore PR #${prNum}: $prTitle`""
-    Write-Host "4. Come back here and press [ENTER] to finish."
-
-    Read-Host "`nPress [ENTER] when resolved and committed..."
-
-    # Safety check: Ensure the user actually committed their fixes
-    git diff-index --quiet HEAD --
-    if ($LASTEXITCODE -ne 0) {
-        Write-Host "⚠️ Uncommitted changes detected! You'll need to commit them manually." -ForegroundColor Red
-    } else {
-        Write-Host "✅ Conflict resolved. PR #${prNum} restored!" -ForegroundColor Green
-    }
+    Write-Host "No .rej files found — the conflict may be tracked as standard Git conflict markers." -ForegroundColor Yellow
+    Write-Host "Open your IDE and look for <<<<<<< markers." -ForegroundColor Cyan
 }
 
-# Clean up the temporary patch file
-if (Test-Path pr_diff.patch) {
-    Remove-Item pr_diff.patch
+Write-Host "`nOnce all conflicts are resolved:"
+Write-Host "  git add ."
+Write-Host "  git commit -m `"Restore PR #${prNum}: $prTitle`""
+Read-Host "`nPress [ENTER] when you have committed the resolved changes..."
+
+# Safety check: confirm the user actually committed
+git diff-index --quiet HEAD --
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "⚠️  Uncommitted changes still detected. Commit them manually before continuing." -ForegroundColor Red
+} else {
+    Write-Host "✅ All clean. PR #${prNum} restored!" -ForegroundColor Green
 }
+
+# Cleanup
+if (Test-Path $patchFile) { Remove-Item $patchFile }
