@@ -125,6 +125,16 @@ function Write-GitObjectToFile {
     }
 }
 
+# ── Helper: Fetch Git Blob info to artificially create index conflicts ────────
+function Get-GitIndexInfo {
+    param([string]$GitRef, [string]$Path, [int]$Stage)
+    $treeLine = git ls-tree $GitRef $Path 2>$null | Select-Object -First 1
+    if ($treeLine -match "^(\d+) blob ([a-f0-9]+)\t") {
+        return "$($Matches[1]) $($Matches[2]) $Stage`t$Path"
+    }
+    return $null
+}
+
 function Get-GitObjectExists {
     param([string]$GitRef)
 
@@ -379,6 +389,11 @@ try {
             New-ParentDirectory $absPath
             $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $absPath
             if ($exitCode -eq 0) {
+                # Pass through Git index to apply native line ending rules
+                git add $relPath
+                git checkout-index -f -- $relPath
+                git reset HEAD -- $relPath 2>&1 | Out-Null
+                
                 $newFiles += $relPath
                 Write-Ok "Created: $relPath"
             } else {
@@ -463,10 +478,40 @@ try {
         }
 
         if ($mergeExit -eq 0 -and -not $hasConflictMarkers) {
+            # Issue 2 Fix: Check if file has real changes. If not, revert to clear false "modified" status.
+            git diff --quiet HEAD -- $relPath 2>$null
+            if ($LASTEXITCODE -eq 0) {
+                # File is logically unchanged from current branch. Wipe metadata modifications.
+                git checkout HEAD -- $relPath 2>&1 | Out-Null
+            } else {
+                # File has real changes. Pass through index to restore proper working tree line endings.
+                git add $relPath
+                git checkout-index -f -- $relPath
+                git reset HEAD -- $relPath 2>&1 | Out-Null
+            }
             $cleanFiles += $relPath
             Write-Ok "Clean merge."
+            
         } elseif ($mergeExit -gt 0 -or $hasConflictMarkers) {
             $conflictFiles += $relPath
+            
+            # Issue 1 Fix: Tell Git this file is officially conflicted by populating Index stages
+            $infoLines = @()
+            $baseLine = Get-GitIndexInfo "FETCH_HEAD~1" $relPath 1
+            if (-not $baseLine) { $baseLine = Get-GitIndexInfo "HEAD" $relPath 1 }
+            if ($baseLine) { $infoLines += $baseLine }
+            
+            $oursLine = Get-GitIndexInfo "HEAD" $relPath 2
+            if ($oursLine) { $infoLines += $oursLine }
+            
+            $theirsLine = Get-GitIndexInfo "FETCH_HEAD" $relPath 3
+            if ($theirsLine) { $infoLines += $theirsLine }
+            
+            if ($infoLines.Count -gt 0) {
+                $infoText = ($infoLines -join "`n") + "`n"
+                $infoText | git update-index --index-info
+            }
+
             if ($hasConflictMarkers -and $mergeExit -eq 0) {
                 Write-Warn "Conflict markers detected even though git returned 0 - file flagged for manual review."
             } else {
