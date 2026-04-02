@@ -1,0 +1,164 @@
+Consider the @/prredo.ps1  powershell script file and the docs below. Currently the issue is that, despite multiple revisions addressing this issue, the conflict markers are still not being correctly applied. "<<<<< Current branch" appears at the top of all conflicted files, then the old file in its entirety, then "=======", then the new changes, then ">>>>>>> PR #..." at the bottom. As such git does not identify there being conflicts. Review the script and revise to fix it, including any other small QoL or efficiency improvements.
+
+402 Wasteland — PR Restoration System
+
+1. Background & Problem Statement
+The Project Environment
+The project is a large Java 8 monolith application developed for a Fortune 500 company. Source control is hosted on GitHub with CI/CD automation via GitHub Actions. At any given time there are multiple in-flight features simultaneously under development and QA testing.
+Branch & Environment Terminology
+
+main — The stable QA / Staging / Demo / Pre-Production branch. Only rock-solid, fully tested features land here. This is the "Golden Master."
+QA2 — The deployment target for the main branch.
+environment/402 — The active development branch. Volatile by design. The integration point for all in-flight feature work.
+The Wasteland — The deployment environment for environment/402. This is where QA actually tests features before they are promoted to main/QA2.
+
+The Core Problem: The Hard Reset
+Periodically, a separate team exercises their right to completely destroy the environment/402 branch by deleting it from GitHub and recreating it as an exact copy of main. This is a known, permitted part of the workflow — the development team has no authority to stop it.
+The consequences are immediate: all open Pull Requests targeting environment/402 are automatically force-closed by GitHub when the base branch is deleted. Every commit that existed on environment/402 but not on main is gone. All in-flight feature work that was mid-test in the Wasteland vanishes. QA testers go to verify a feature and find it entirely missing with no warning.
+The team cannot prevent resets. The entire problem space is: given that a reset has already occurred, how do we get in-flight PR changes back into the new environment/402 as quickly and safely as possible so QA testing can resume?
+Why Standard Git Recovery Fails
+When environment/402 is deleted and recreated from main, its commit history is entirely replaced. It no longer shares a common ancestor with the feature branches that were previously merged into it. Git's merge algorithms are designed around finding a common ancestor and calculating what changed on each side since that point. When the branch history has been wholesale replaced, Git cannot find a valid merge base, and the result is an avalanche of false conflicts covering every file ever touched differently between the two histories.
+
+2. Evolution of the Solution
+Attempt 1: Long-Lived Integration Branch (team-dev)
+The idea was to maintain a persistent team-dev branch that is never deleted. All feature branches merge into team-dev. When a reset occurs, merge team-dev back into the new environment/402.
+This failed because when environment/402 is hard-reset to main, its commit graph is replaced. The team-dev branch still contains commits referencing the old environment/402 history. Merging team-dev into the rewritten environment/402 presents Git with two branches that have fundamentally diverged histories — not just different code, but different ancestry. The merge base calculation produces a nonsensical result and Git generates massive, unresolvable conflicts across the entire codebase.
+Attempt 2: Native Squash Merge (git merge --squash)
+The idea was to fetch the hidden GitHub PR reference (refs/pull/ID/head) and run git merge --squash. Squashing collapses all commits into one, theoretically sidestepping the history problem.
+This failed because squash merge still uses Git's merge base calculation internally. Because the feature branch was originally created from an older version of main, and the new environment/402 has been reset to the latest main, Git's common-ancestor algorithm attempts to incorporate every commit in the feature branch's history that post-dates the incorrectly computed merge base. For a PR that changed only three files, this could manifest as hundreds of false conflicts touching files the PR never modified. --squash flattens commits but does not change the merge base calculation.
+Attempt 3: Raw Diff + git apply (Previous Architecture)
+The idea was to detach entirely from Git's history tree. Use the GitHub CLI to download the isolated textual diff of the PR and apply it directly as a patch using git apply --3way. This was a conceptual breakthrough: by treating the PR as a text patch rather than a set of commits, the history problem is bypassed entirely.
+Two roadblocks were hit.
+Roadblock A — PowerShell UTF-16 Encoding: The first implementation used PowerShell's native redirection operator (>) to write the patch file. PowerShell defaults to UTF-16 LE encoding for its redirection operator, injecting a null byte between every character. git apply reads this as a corrupt binary file and fails immediately. Resolution: route the redirection through cmd.exe, which uses standard UTF-8/ASCII output.
+cmd.exe /c "gh pr diff $prNum > patch.diff"
+Roadblock B — git apply --3way silently falling back to .rej files: Even with encoding fixed, git apply --3way produced .rej sidecar files instead of inline conflict markers. Nearly every file in a given PR got a .rej file. Two compounding issues caused this.
+First, context mismatch: git apply uses 3 lines of surrounding context as anchor points when placing each hunk. If the new environment/402 (reset from a more recent main) has any changes to those surrounding lines compared to when the PR was opened, the hunk anchor fails and the whole hunk is rejected.
+Second, silent --3way fallback: The --3way flag is supposed to rescue a failed hunk by performing a 3-way merge using the original file blob from the Git object store. But --3way silently gives up and falls back to --reject behaviour if it cannot find that original blob locally. git fetch origin pull/ID/head only fetches the tip commit of the feature branch, not necessarily the base commit blobs the diff was calculated against. Because those blobs are frequently absent, --3way never actually triggers. The developer gets .rej files every time.
+A .rej file contains only the specific hunk that couldn't be applied. It is a sidecar file with no connection to the source file — the developer must manually find where the hunk belongs and apply it by hand. For a PR touching 13 files, this means 13 .rej files and 13 manual operations. Not workable under time pressure.
+
+3. Current Architecture: git merge-file
+The Core Insight
+The root cause of the --3way failure was that git apply is a history-aware operation requiring blob objects from the Git object store. When those blobs are absent, it silently degrades.
+The solution is git merge-file. It is a pure text operation. It takes three files on disk — OURS, BASE, and THEIRS — and performs a line-by-line 3-way merge with no reference to the Git object store, commit history, or ancestry graph whatsoever. It always produces output. When lines conflict, it always writes inline conflict markers directly into the OURS file. No .rej files, no silent fallbacks, no dependency on blob availability.
+The Three-Way Merge Model
+For each file modified by the PR, the script constructs three versions on disk:
+
+OURS — The current file on disk in the working tree. Represents the state of the file on the freshly reset environment/402 (identical to main).
+BASE — The file at FETCH_HEAD~1, written via cmd.exe. Approximates the point at which the PR author branched from main.
+THEIRS — The file at FETCH_HEAD, written via cmd.exe. The file as it exists at the tip of the PR branch — the desired end state.
+
+git merge-file computes the difference between BASE and THEIRS (what the PR changed), then applies those changes to OURS. If a region was changed in both OURS and by the PR since BASE, a conflict block is written with standard markers. The merged result replaces the working copy file directly.
+Why cmd.exe Is Used for All File Writes
+Any git show output passing through PowerShell's pipeline is subject to PowerShell's string encoding behaviour. PowerShell internally represents strings as UTF-16 and can alter line endings, strip bytes, or collapse multi-line output into a single string depending on how the pipeline is consumed. When git merge-file receives a file mangled this way, it sees the entire file content as a single line and treats every line in THEIRS as a conflicting change against OURS — producing one massive conflict block covering the entire file rather than surgical markers at the actual changed lines.
+This was the cause of the symptom where every file showed >>402 at the top, then ====, then the entire file content on one line, then the PR closing marker. The pipeline had collapsed the file to a single line and git merge-file saw a total conflict.
+The fix is consistent: every file written from git show output uses cmd.exe redirection, preserving the raw byte stream without any PowerShell pipeline transformation.
+BASE Approximation and Fallback
+Using FETCH_HEAD~1 as BASE is a heuristic. It works correctly for the common case of a feature branch with a clean linear history. If the file did not exist at FETCH_HEAD~1, git cat-file -e reports its absence and the script falls back to using OURS as BASE. This is a noisier merge — git merge-file will treat more of THEIRS's content as new and may produce more conflict blocks than strictly necessary — but it still produces a usable inline-marker result rather than a failure.
+New File and Deleted File Handling
+These are handled as special cases before the three-way merge logic:
+
+New file (exists in FETCH_HEAD, does not exist on disk): Written directly from FETCH_HEAD to the working tree via cmd.exe. No merge needed.
+Deleted file (exists on disk, does not exist in FETCH_HEAD): Removed with Remove-Item. No merge needed.
+Missing from both sides: Logged as a warning and skipped.
+
+
+4. Script Walkthrough: restore_402.ps1 v4
+Usage
+.\restore_402.ps1           # Normal run
+.\restore_402.ps1 -DryRun   # Preview only — no files modified
+The developer must manually run git fetch and ensure the working tree is clean before executing the script. The script verifies cleanliness at startup and exits if the condition is not met.
+Section 1: Pre-Flight Checks
+Four checks run before any PR information is requested.
+GitHub CLI detection: checks for gh on PATH via Get-Command, then falls back to looking for a portable gh.exe placed next to the script itself. This supports corporate environments where global binary installation is restricted. Exits if neither is found.
+Repository path validation: prompts for the local repository path, confirms the directory exists, and confirms a .git folder is present.
+Working tree cleanliness: runs git status --porcelain. If any output is returned, the script lists the affected files and exits. This prevents the script from incorporating pre-existing changes into the restored state.
+Section 2: PR Details
+The developer pastes a GitHub PR URL or bare PR number. The script extracts the PR number by splitting the URL on "/" and taking the last segment, or accepts a bare integer directly. It calls gh pr view with --json to fetch the title, state, author, and head branch name in structured JSON, then displays a summary. If the PR state is MERGED, it issues a warning and requires the developer to explicitly type YES to continue, since a merged PR's changes may already be present in environment/402.
+Section 3: Fetch and Patch Download
+Two independent operations run here.
+git fetch origin pull/ID/head fetches the PR's head ref from GitHub's virtual refs namespace into FETCH_HEAD. GitHub maintains these read-only refs for every PR permanently, even after the source branch is deleted. This populates the local object store with the commit and blob objects from the PR branch.
+gh pr diff downloads the isolated textual diff of the PR via cmd.exe redirection. After download, the script validates that the file exists, is non-empty, and that its first line begins with "diff --git". If gh returned an error message to stdout instead of a diff (which cmd.exe redirection would capture), this check catches it and the script exits with the error content displayed. Any stale patch file from a previous crashed run is detected and removed.
+Section 4: Patch Analysis and Dry-Run
+The patch file is parsed line-by-line. Every line matching diff --git a/<path> b/<path> is captured and the b/ path is extracted. This produces the definitive list of files the PR touches, which is displayed to the developer before any modifications are made. The developer can abort here.
+If -DryRun was passed, the script exits after printing the file list. No temp directories are created, no files are modified, and the patch file is cleaned up. Dry-run is useful for triaging a backlog of PRs to understand which ones are likely to apply cleanly before committing to the restore.
+Section 5: Apply via git merge-file
+For each file in the list:
+Existence is checked using git cat-file -e on both sides — a lightweight boolean object existence check with no output, avoiding the pipeline encoding issues that plagued earlier git show probes.
+New and deleted files are handled as described above.
+For modified files, three temp files are created in a hidden .pr_restore_tmp directory in the repository root. OURS is a plain Copy-Item from the live working copy (already correct encoding on disk). THEIRS and BASE are written via cmd.exe redirection from git show.
+git merge-file is invoked using PowerShell argument splatting (@array syntax) rather than backtick line continuation. Backtick continuation is brittle in PowerShell — a single trailing space after the backtick breaks the block and misaligns brace tracking for the entire rest of the script, producing cascading "unexpected token" parse errors.
+powershell$mergeArgs = @(
+    "-L", "Current branch",
+    "-L", "Base",
+    "-L", "PR #$prNum: $prTitle",
+    $oursFile, $baseFile, $theirsFile
+)
+git merge-file @mergeArgs
+```
+
+git merge-file modifies the OURS temp file in place. Exit code 0 means clean merge. Exit code greater than 0 means N conflict blocks were written as inline markers. Negative exit code means an error, typically a binary file. The merged result is copied back over the live working copy file regardless, and the file is added to either the clean or conflict list accordingly.
+
+After all files are processed, the temp directory is deleted.
+
+**Section 6: Summary**
+
+The script prints counts and filenames for clean merges, new files, deleted files, and conflicts, plus elapsed time. No commit is made and no push is issued. If all files merged cleanly, the developer is told to review in their IDE then commit and push manually. If conflicts remain, the specific files are listed with instructions to resolve the inline marker blocks before committing.
+
+---
+
+## 5. Requirements & Constraints
+
+- No automated webhooks or triggers — the branch deletion force-closes all PRs and breaks webhook-based automation. The script is on-demand only.
+- No automatic PR discovery — the developer provides the PR URL explicitly, one at a time.
+- One PR per execution — multiple PRs are restored by running the script multiple times.
+- Windows / PowerShell only — no Bash or WSL dependency.
+- No admin installation rights — gh can be supplied as a portable exe placed next to the script.
+- No automatic commit or push — all changes are left as unstaged working tree modifications for the developer to review and commit manually.
+- No branch enforcement — the script does not check or enforce which branch is active. A clean working tree is the only pre-flight gate.
+
+---
+
+## 6. Known Limitations
+
+**BASE approximation.** Using FETCH_HEAD~1 as BASE is a heuristic. It works correctly for a standard linear feature branch. It can produce noisier output (more conflict blocks than strictly necessary) when the PR branch has multiple commits with changes across them, the author rebased before opening the PR, or the file didn't exist at FETCH_HEAD~1 and the OURS fallback is used. In all these cases the markers are still resolvable and the correct final state is always the THEIRS version of the conflicting region.
+
+**Binary files.** git merge-file operates on text only. If a PR contains a binary file modification, git merge-file returns a negative exit code. The script logs this and adds the file to the conflict list. The developer must manually retrieve the binary file from the PR.
+
+**Merge ordering for multiple PRs.** If PR B depends on changes introduced by PR A, restore PR A first. The script has no awareness of inter-PR dependencies.
+
+---
+
+## 7. Quick Reference
+
+**Step-by-step runbook**
+
+1. Identify the PRs that need to be restored.
+2. Open a PowerShell terminal.
+3. Run `git fetch` in your local repository.
+4. Run `git checkout environment/402`.
+5. Confirm the working tree is clean with `git status`.
+6. Run `.\restore_402.ps1` (optionally with `-DryRun` first).
+7. Enter your local repository path when prompted.
+8. Paste the PR URL when prompted.
+9. Review the file list and confirm with Y.
+10. If clean: review changes in your IDE, then commit and push.
+11. If conflicts: open each listed file, resolve the conflict marker blocks, then commit and push.
+12. Repeat from step 6 for each additional PR.
+
+**Conflict marker format**
+```
+<<<<<<< Current branch
+    // Code as it exists in environment/402 (from main)
+=======
+    // Code as the PR author wrote it
+>>>>>>> PR #12345: Feature title
+Decide which version is correct (or combine them), delete all three marker lines and the unwanted version, and save. Most IDEs have a built-in conflict resolution UI for this.
+Key commands
+
+.\restore_402.ps1 — normal run
+.\restore_402.ps1 -DryRun — preview affected files only
+git status — verify clean working tree before running
+git fetch — update local object store before running
+git diff — review all applied changes before committing
+git add . && git commit -m "..." — stage and commit after review
+git push origin environment/402 — push restored changes
