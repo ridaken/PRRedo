@@ -2,8 +2,8 @@
 #  restore_402.ps1  -  402 Wasteland PR Restorer  (merge-file edition)
 #
 #  USAGE:
-#    .\restore_402.ps1              Normal run
-#    .\restore_402.ps1 -DryRun      Preview only - no files are modified
+#    .\restore_402.ps1             Normal run
+#    .\restore_402.ps1 -DryRun     Preview only - no files are modified
 #
 #  REQUIREMENTS:
 #    - Run AFTER you have already done: git fetch && git checkout environment/402
@@ -51,77 +51,77 @@ function Get-SafeTempName {
     ).Replace('-', '').Substring(0, 16)
 }
 
-function Get-GitContentEncoding {
-    param([string]$FilePath)
+# ── Helper: Safely convert line endings to LF purely at the byte level ────────
+# PowerShell string replacements risk corrupting non-UTF8 encodings. This
+# guarantees the file is strictly LF without touching the actual text encoding.
+function Convert-FileToLF {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path)) { return }
+    
+    $bytes = [System.IO.File]::ReadAllBytes($Path)
+    if ($bytes.Length -eq 0) { return }
 
-    $attrOutput = git check-attr --cached --all -- "$FilePath" 2>$null
-    foreach ($line in $attrOutput) {
-        if ($line -match ':\s*working-tree-encoding:\s*(.+)$') {
-            return $Matches[1].Trim()
+    # Binary check: look for null byte in the first 8KB
+    $isBinary = $false
+    $checkLen = [math]::Min($bytes.Length, 8000)
+    for ($i = 0; $i -lt $checkLen; $i++) {
+        if ($bytes[$i] -eq 0) { $isBinary = $true; break }
+    }
+    if ($isBinary) { return }
+
+    # Convert CRLF (13, 10) to LF (10)
+    $memStream = New-Object System.IO.MemoryStream($bytes.Length)
+    for ($i = 0; $i -lt $bytes.Length; $i++) {
+        if ($bytes[$i] -eq 13) {
+            if (($i + 1 -lt $bytes.Length) -and ($bytes[$i+1] -eq 10)) {
+                continue # Skip \r, let the \n be written in next iteration
+            } else {
+                $memStream.WriteByte(10) # convert lone \r to \n
+                continue
+            }
         }
+        $memStream.WriteByte($bytes[$i])
     }
-
-    return $null
+    
+    if ($memStream.Length -ne $bytes.Length) {
+        [System.IO.File]::WriteAllBytes($Path, $memStream.ToArray())
+    }
+    $memStream.Dispose()
 }
 
-function Normalize-LineEndings {
-    param([string]$Text)
-
-    if ($null -eq $Text) {
-        return ""
-    }
-
-    return ($Text -replace "`r`n", "`n") -replace "`r", "`n"
-}
-
-# ── Helper: write a git object to a file safely without PowerShell line mangling ──
-# [`git show`](prredo.ps1:106) output must preserve original newlines. Instead of shell
-# redirection, capture stdout as raw bytes and write them directly to disk so
-# [`git merge-file`](prredo.ps1:475) sees the true file structure.
+# ── Helper: write a git object directly to disk avoiding ALL PowerShell IO ────
+# PowerShell's Start-Process -RedirectStandardOutput forces output to UTF-16LE.
+# By attaching directly to the .NET Process BaseStream, we copy the exact raw 
+# Git blob bytes to disk with zero encoding or line ending corruption.
 function Write-GitObjectToFile {
     param(
         [string]$GitRef,
-        [string]$OutPath,
-        [string]$EncodingName = $null
+        [string]$OutPath
     )
 
-    $stdoutFile = Join-Path ([System.IO.Path]::GetDirectoryName($OutPath)) ("stdout_$(Get-SafeTempName $GitRef).tmp")
-    $stderrFile = Join-Path ([System.IO.Path]::GetDirectoryName($OutPath)) ("stderr_$(Get-SafeTempName $GitRef).tmp")
+    Remove-PathIfExists $OutPath
 
-    Remove-PathIfExists $stdoutFile
-    Remove-PathIfExists $stderrFile
+    $psi = New-Object System.Diagnostics.ProcessStartInfo
+    $psi.FileName = "git.exe"
+    $psi.Arguments = "show --no-textconv `"$GitRef`""
+    $psi.RedirectStandardOutput = $true
+    $psi.RedirectStandardError = $true
+    $psi.UseShellExecute = $false
+    $psi.CreateNoWindow = $true
 
     try {
-        $process = Start-Process -FilePath "git.exe" `
-            -ArgumentList @("show", "--no-textconv", $GitRef) `
-            -NoNewWindow -PassThru -Wait `
-            -RedirectStandardOutput $stdoutFile `
-            -RedirectStandardError $stderrFile
-
-        if ($process.ExitCode -ne 0) {
-            return $process.ExitCode
-        }
-
-        $bytes = if (Test-Path -LiteralPath $stdoutFile) {
-            [System.IO.File]::ReadAllBytes($stdoutFile)
-        } else {
-            [byte[]]@()
-        }
-
-        if ($EncodingName) {
-            $encoding = [System.Text.Encoding]::GetEncoding($EncodingName)
-            $text = $encoding.GetString($bytes)
-            $normalized = Normalize-LineEndings $text
-            [System.IO.File]::WriteAllText($OutPath, $normalized, $encoding)
-        } else {
-            [System.IO.File]::WriteAllBytes($OutPath, $bytes)
-        }
-
-        return 0
-    }
-    finally {
-        Remove-PathIfExists $stdoutFile
-        Remove-PathIfExists $stderrFile
+        $process = [System.Diagnostics.Process]::Start($psi)
+        $outStream = [System.IO.File]::Create($OutPath)
+        
+        # Copy raw bytes directly from standard out to the file
+        $process.StandardOutput.BaseStream.CopyTo($outStream)
+        
+        $outStream.Dispose()
+        $process.WaitForExit()
+        return $process.ExitCode
+    } catch {
+        if ($null -ne $outStream) { $outStream.Dispose() }
+        return -1
     }
 }
 
@@ -155,7 +155,7 @@ Write-Host ""
 Write-Host "  +----------------------------------------------+" -ForegroundColor Cyan
 Write-Host "  |      402 Wasteland  -  PR Restorer  v5       |" -ForegroundColor Cyan
 if ($DryRun) {
-    Write-Host "  |           *** DRY RUN MODE ***               |" -ForegroundColor Yellow
+    Write-Host "  |            *** DRY RUN MODE *** |" -ForegroundColor Yellow
 }
 Write-Host "  +----------------------------------------------+" -ForegroundColor Cyan
 Write-Host ""
@@ -202,7 +202,7 @@ Write-Ok "Repository: $repoPath"
 $dirty = git status --porcelain 2>&1
 if ($dirty) {
     Write-Err "Working tree has uncommitted changes:"
-    $dirty | ForEach-Object { Write-Host "       $_" -ForegroundColor DarkYellow }
+    $dirty | ForEach-Object { Write-Host "        $_" -ForegroundColor DarkYellow }
     Write-Host "     Stash or commit these before running the restorer." -ForegroundColor Yellow
     exit 1
 } else {
@@ -346,24 +346,6 @@ if ($proceed -eq 'n' -or $proceed -eq 'N') {
 
 # =============================================================================
 #  SECTION 5 - APPLY VIA git merge-file
-#
-#  For each file in the patch we perform a genuine 3-way text merge.
-#  All temp files are written via cmd.exe redirection to guarantee correct
-#  line endings - PowerShell pipeline encoding corrupts git show output
-#  and causes git merge-file to see the entire file as one line, which
-#  produces a single giant conflict block instead of surgical markers.
-#
-#  Three inputs to git merge-file:
-#    OURS   = current file on disk (the reset branch)
-#    BASE   = file at FETCH_HEAD~1 (where the PR author branched from)
-#             Falls back to OURS if unavailable.
-#    THEIRS = file at FETCH_HEAD (tip of the PR branch)
-#
-#  git merge-file modifies the OURS temp file in place, then we copy it
-#  back over the working copy. No commits are made.
-#    Exit  0  = clean merge
-#    Exit >0  = N conflict blocks written as inline markers
-#    Exit <0  = error (e.g. binary file)
 # =============================================================================
 Write-Step "Applying Changes"
 
@@ -395,7 +377,7 @@ try {
         if ((-not $oursExists) -and $theirsExists) {
             Write-Info "New file - writing directly from PR head."
             New-ParentDirectory $absPath
-            $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $absPath (Get-GitContentEncoding $relPath)
+            $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $absPath
             if ($exitCode -eq 0) {
                 $newFiles += $relPath
                 Write-Ok "Created: $relPath"
@@ -429,9 +411,7 @@ try {
 
         Copy-Item -LiteralPath $absPath -Destination $oursFile -Force
 
-        $fileEncoding = Get-GitContentEncoding $relPath
-
-        $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $theirsFile $fileEncoding
+        $exitCode = Write-GitObjectToFile "FETCH_HEAD:$relPath" $theirsFile
         if ($exitCode -ne 0) {
             Write-Err "Could not retrieve THEIRS for '$relPath' - skipping."
             $skippedFiles += $relPath
@@ -439,7 +419,7 @@ try {
         }
 
         if (Get-GitObjectExists "FETCH_HEAD~1:$relPath") {
-            $exitCode = Write-GitObjectToFile "FETCH_HEAD~1:$relPath" $baseFile $fileEncoding
+            $exitCode = Write-GitObjectToFile "FETCH_HEAD~1:$relPath" $baseFile
             if ($exitCode -ne 0) {
                 Copy-Item -LiteralPath $absPath -Destination $baseFile -Force
                 Write-Warn "Could not write BASE from FETCH_HEAD~1 - using OURS as base."
@@ -450,6 +430,13 @@ try {
             Copy-Item -LiteralPath $absPath -Destination $baseFile -Force
             Write-Warn "File not present at FETCH_HEAD~1 - using OURS as base (merge may be noisier)."
         }
+
+        # ── NORMALIZATION GATE ────────────────────────────────────────────────
+        # Force all three files to identical LF line endings before merging.
+        # This prevents entire-file conflicts caused by Windows CRLF mismatches.
+        Convert-FileToLF $oursFile
+        Convert-FileToLF $baseFile
+        Convert-FileToLF $theirsFile
 
         $mergeArgs = @(
             "merge-file",
